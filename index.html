@@ -1050,7 +1050,8 @@ tr:hover td { background: var(--surface3); }
             <option value="ferramentas">Ferramentas</option>
             <option value="outro">Outro</option>
           </select>
-          <button class="btn btn-primary" onclick="openSupplierModal()">+ Adicionar fornecedor</button>
+          <button class="btn btn-primary" onclick="openSupplierModal()">+ Meu fornecedor</button>
+          <div id="admin-sup-btn"></div>
         </div>
         <div class="card" style="margin-bottom:16px;padding:16px 20px;background:var(--accent-dim);border:1px solid rgba(107,26,46,0.15)">
           <div style="display:flex;align-items:center;gap:12px">
@@ -1422,6 +1423,8 @@ async function loadUserData(uid) {
       state.quotes     = data.quotes     || [];
       state.leads      = data.leads      || [];
       state.suppliers  = data.suppliers  || [];
+      // Load official suppliers from admin collection
+      loadOfficialData();
     }
     setSyncStatus('ok');
   } catch(e) {
@@ -1445,6 +1448,8 @@ async function loadUserData(uid) {
       state.quotes     = data.quotes     || [];
       state.leads      = data.leads      || [];
       state.suppliers  = data.suppliers  || [];
+      // Load official suppliers from admin collection
+      loadOfficialData();
       renderPage(currentPage);
       updateBadges();
       setSyncStatus('ok');
@@ -1453,6 +1458,33 @@ async function loadUserData(uid) {
 }
 
 let _saving = false;
+// Load official/admin data (shared across all users)
+async function loadOfficialData() {
+  try {
+    const adminDoc = doc(db, 'admin', 'official');
+    const snap = await getDoc(adminDoc);
+    if(snap.exists()) {
+      state.officialSuppliers = snap.data().suppliers || [];
+    } else {
+      state.officialSuppliers = [];
+    }
+    if(currentPage === 'suppliers') renderSuppliers();
+  } catch(e) {
+    state.officialSuppliers = [];
+  }
+}
+
+window._saveOfficialSuppliers = async function(suppliers) {
+  try {
+    const adminDoc = doc(db, 'admin', 'official');
+    await setDoc(adminDoc, { suppliers, updatedAt: new Date().toISOString() });
+    return true;
+  } catch(e) {
+    console.error('Error saving official suppliers', e);
+    return false;
+  }
+};
+
 window._saveToFirebase = async function() {
   if(!DATA_DOC) return;
   setSyncStatus('syncing');
@@ -1530,6 +1562,16 @@ onAuthStateChanged(auth, (user) => {
 </script>
 <script>
 // ===== STATE =====
+// ===== ADMIN CONFIG =====
+const ADMIN_EMAIL = 'jcampos.msk@gmail.com';
+function isAdmin() {
+  return window._currentUser && window._currentUser.email === ADMIN_EMAIL;
+}
+function getUserPlanLevel() {
+  if(isAdmin()) return 'business'; // Admin always has top plan
+  return getUserPlan();
+}
+
 // ===== STATUS CONSTANTS (ASCII-safe, no accents) =====
 const STATUS = {
   ACTIVE:    'Em Curso',
@@ -1955,8 +1997,10 @@ document.addEventListener('click', function(e) {
   if (action === 'delete-quote') deleteQuote(id);
   if (action === 'edit-lead') openLeadModal(id);
   if (action === 'delete-lead') deleteLead(id);
-  if (action === 'edit-supplier') openSupplierModal(id);
+  if (action === 'edit-supplier') { _editingOfficialSupplier=false; openSupplierModal(id); }
+  if (action === 'edit-official-supplier') { _editingOfficialSupplier=true; openSupplierModal(id, true); }
   if (action === 'delete-supplier') deleteSupplier(id);
+  if (action === 'delete-official-supplier') deleteOfficialSupplier(id);
 });
 
 // ===== CLIENTS =====
@@ -3632,10 +3676,9 @@ function checkProAccess(page) {
 }
 
 function getUserPlan() {
-  // Future: read from Firebase user profile
-  // For now: read from localStorage (set when selecting plan)
+  if(isAdmin()) return 'business'; // Admin always has top plan
   const trial = getTrialInfo();
-  return trial.plan || 'essencial'; // default during trial
+  return trial.plan || 'essencial';
 }
 
 function getLeadDelay() {
@@ -3781,14 +3824,27 @@ const supCatIcons = {materiais:'🧱',ceramica:'🪨',tintas:'🎨',electrico:'�
 let supEditingId = null;
 
 function renderSuppliers() {
-  const isPro = checkProAccess('suppliers');
-  document.getElementById('suppliers-pro-gate').style.display = isPro?'none':'block';
-  document.getElementById('suppliers-content').style.display = isPro?'block':'none';
-  if(!isPro) return;
+  document.getElementById('suppliers-pro-gate').style.display = 'none';
+  document.getElementById('suppliers-content').style.display = 'block';
+  // Admin button
+  const adminBtn = document.getElementById('admin-sup-btn');
+  if(adminBtn) {
+    adminBtn.innerHTML = isAdmin()
+      ? '<button class="btn btn-ghost" onclick="openOfficialSupplierModal()" style="background:var(--accent-dim);color:var(--accent);border:1px solid rgba(107,26,46,0.2)">⭐ + Fornecedor oficial</button>'
+      : '';
+  }
 
   const q=(document.getElementById('search-suppliers')||{}).value||'';
   const cat=(document.getElementById('filter-supplier-cat')||{}).value||'';
-  let sups=(state.suppliers||[]).filter(s=>{
+  const admin = isAdmin();
+
+  // Official suppliers (from admin) + user's own suppliers
+  const officialSups = (state.officialSuppliers||[]).filter(s=>{
+    const mq=!q||(s.name||'').toLowerCase().includes(q.toLowerCase());
+    const mc=!cat||s.cat===cat;
+    return mq&&mc;
+  });
+  const userSups = (state.suppliers||[]).filter(s=>{
     const mq=!q||(s.name||'').toLowerCase().includes(q.toLowerCase());
     const mc=!cat||s.cat===cat;
     return mq&&mc;
@@ -3796,39 +3852,49 @@ function renderSuppliers() {
 
   const el=document.getElementById('suppliers-list');
   const empty=document.getElementById('suppliers-empty');
-  if(!sups.length){el.innerHTML='';empty.style.display='block';return;}
+  if(!officialSups.length && !userSups.length){el.innerHTML='';empty.style.display='block';return;}
   empty.style.display='none';
 
-  el.innerHTML=`<table style="width:100%;border-collapse:collapse">
-    <thead><tr>
-      <th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)">Fornecedor</th>
-      <th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)" class="hide-mobile">Categoria</th>
-      <th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)" class="hide-mobile">Contacto</th>
-      <th style="border-bottom:1px solid var(--border)"></th>
-    </tr></thead>
-    <tbody>${sups.map(s=>`<tr>
-      <td style="padding:12px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <div style="width:36px;height:36px;border-radius:9px;background:var(--surface3);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">${supCatIcons[s.cat]||'📦'}</div>
-          <div>
-            <div style="font-size:13px;font-weight:600;color:var(--text)">${s.name}</div>
-            ${s.nif?'<div style="font-size:11px;color:var(--text3)">NIF: '+s.nif+'</div>':''}
-          </div>
+  const renderRow = (s, isOfficial) => `<tr>
+    <td style="padding:12px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:36px;height:36px;border-radius:9px;background:${isOfficial?'var(--accent-dim)':'var(--surface3)'};display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">${supCatIcons[s.cat]||'📦'}</div>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)">${s.name}${isOfficial?'<span style="background:var(--accent);color:#fff;font-size:9px;padding:1px 6px;border-radius:10px;font-weight:700;margin-left:6px;vertical-align:middle">OFICIAL</span>':''}</div>
+          ${s.nif?'<div style="font-size:11px;color:var(--text3)">NIF: '+s.nif+'</div>':''}
         </div>
-      </td>
-      <td style="padding:12px;font-size:12px;color:var(--text2)" class="hide-mobile">${supCatLabels[s.cat]||'Outro'}</td>
-      <td style="padding:12px" class="hide-mobile">
-        <div style="font-size:12px;color:var(--text2)">${s.phone||''}</div>
-        <div style="font-size:12px;color:var(--accent)">${s.email?'<a href="mailto:'+s.email+'" style="color:var(--accent);text-decoration:none">'+s.email+'</a>':''}</div>
-      </td>
-      <td style="padding:12px">
-        <div style="display:flex;gap:6px">
-          <button class="btn btn-ghost" style="padding:5px 10px;font-size:11px" data-action="edit-supplier" data-id="${s.id}">Editar</button>
-          <button class="btn btn-danger" style="padding:5px 10px;font-size:11px" data-action="delete-supplier" data-id="${s.id}">✕</button>
-        </div>
-      </td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+      </div>
+    </td>
+    <td style="padding:12px;font-size:12px;color:var(--text2)" class="hide-mobile">${supCatLabels[s.cat]||'Outro'}</td>
+    <td style="padding:12px" class="hide-mobile">
+      <div style="font-size:12px;color:var(--text2)">${s.phone||''}</div>
+      <div style="font-size:12px">${s.email?'<a href="mailto:'+s.email+'" style="color:var(--accent);text-decoration:none">'+s.email+'</a>':''}</div>
+    </td>
+    <td style="padding:12px">
+      <div style="display:flex;gap:6px">
+        ${(!isOfficial || admin) ? '<button class="btn btn-ghost" style="padding:5px 10px;font-size:11px" data-action="'+(isOfficial?'edit-official-supplier':'edit-supplier')+'" data-id="'+s.id+'">Editar</button>' : ''}
+        ${(!isOfficial || admin) ? '<button class="btn btn-danger" style="padding:5px 10px;font-size:11px" data-action="'+(isOfficial?'delete-official-supplier':'delete-supplier')+'" data-id="'+s.id+'">✕</button>' : ''}
+        ${(isOfficial && !admin) ? '<span style="font-size:11px;color:var(--text3);padding:5px 8px">Só leitura</span>' : ''}
+      </div>
+    </td>
+  </tr>`;
+
+  let html = '<table style="width:100%;border-collapse:collapse"><thead><tr>';
+  html += '<th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)">Fornecedor</th>';
+  html += '<th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)" class="hide-mobile">Categoria</th>';
+  html += '<th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)" class="hide-mobile">Contacto</th>';
+  html += '<th style="border-bottom:1px solid var(--border)"></th></tr></thead><tbody>';
+
+  if(officialSups.length) {
+    html += '<tr><td colspan="4" style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:0.5px;background:var(--accent-dim)">⭐ Fornecedores Oficiais Anarth Pro</td></tr>';
+    html += officialSups.map(s=>renderRow(s, true)).join('');
+  }
+  if(userSups.length) {
+    html += '<tr><td colspan="4" style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;background:var(--surface3)">Os meus fornecedores</td></tr>';
+    html += userSups.map(s=>renderRow(s, false)).join('');
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
 }
 
 function openSupplierModal(id) {
@@ -3851,10 +3917,41 @@ function openSupplierModal(id) {
   openModal('modal-supplier');
 }
 
+// _isOfficialSupplier flag set when editing official
+let _editingOfficialSupplier = false;
+
+function openOfficialSupplierModal(id) {
+  _editingOfficialSupplier = true;
+  openSupplierModal(id, true);
+}
+
+function openSupplierModal(id, official) {
+  _editingOfficialSupplier = official || false;
+  supEditingId=id||null;
+  document.getElementById('modal-supplier-title').textContent =
+    (_editingOfficialSupplier ? '⭐ ' : '') + (id?'Editar Fornecedor':'Novo Fornecedor') +
+    (_editingOfficialSupplier ? ' (Oficial)' : '');
+  const pool = _editingOfficialSupplier ? (state.officialSuppliers||[]) : (state.suppliers||[]);
+  const s=id?pool.find(x=>x.id===id):null;
+  if(s){
+    document.getElementById('sup-name').value=s.name||'';
+    document.getElementById('sup-cat').value=s.cat||'materiais';
+    document.getElementById('sup-phone').value=s.phone||'';
+    document.getElementById('sup-email').value=s.email||'';
+    document.getElementById('sup-web').value=s.web||'';
+    document.getElementById('sup-nif').value=s.nif||'';
+    document.getElementById('sup-address').value=s.address||'';
+    document.getElementById('sup-notes').value=s.notes||'';
+  } else {
+    ['sup-name','sup-phone','sup-email','sup-web','sup-nif','sup-address','sup-notes'].forEach(id=>document.getElementById(id).value='');
+    document.getElementById('sup-cat').value='materiais';
+  }
+  openModal('modal-supplier');
+}
+
 function saveSupplier() {
   const name=document.getElementById('sup-name').value.trim();
   if(!name){toastError('Introduza o nome do fornecedor');return;}
-  if(!state.suppliers) state.suppliers=[];
   const s={
     id:supEditingId||uid(), name,
     cat:document.getElementById('sup-cat').value,
@@ -3865,16 +3962,36 @@ function saveSupplier() {
     address:document.getElementById('sup-address').value,
     notes:document.getElementById('sup-notes').value,
   };
-  if(supEditingId){const i=state.suppliers.findIndex(x=>x.id===supEditingId);state.suppliers[i]=s;}
-  else state.suppliers.push(s);
-  save();closeModal('modal-supplier');renderSuppliers();
-  toast(supEditingId?'Fornecedor atualizado':'Fornecedor adicionado ✓');
+  if(_editingOfficialSupplier && isAdmin()) {
+    // Save to official collection
+    if(!state.officialSuppliers) state.officialSuppliers=[];
+    if(supEditingId){const i=state.officialSuppliers.findIndex(x=>x.id===supEditingId);state.officialSuppliers[i]=s;}
+    else state.officialSuppliers.push(s);
+    if(window._saveOfficialSuppliers) window._saveOfficialSuppliers(state.officialSuppliers);
+    closeModal('modal-supplier');renderSuppliers();
+    toast(supEditingId?'Fornecedor oficial atualizado ✓':'Fornecedor oficial adicionado ✓');
+  } else {
+    if(!state.suppliers) state.suppliers=[];
+    if(supEditingId){const i=state.suppliers.findIndex(x=>x.id===supEditingId);state.suppliers[i]=s;}
+    else state.suppliers.push(s);
+    save();closeModal('modal-supplier');renderSuppliers();
+    toast(supEditingId?'Fornecedor atualizado':'Fornecedor adicionado ✓');
+  }
 }
 
 function deleteSupplier(id) {
   showConfirm('Eliminar este fornecedor?',()=>{
     state.suppliers=(state.suppliers||[]).filter(s=>s.id!==id);
     save();renderSuppliers();toast('Fornecedor eliminado');
+  },true);
+}
+
+function deleteOfficialSupplier(id) {
+  if(!isAdmin()){toastError('Apenas o administrador pode eliminar fornecedores oficiais');return;}
+  showConfirm('Eliminar este fornecedor oficial?',()=>{
+    state.officialSuppliers=(state.officialSuppliers||[]).filter(s=>s.id!==id);
+    if(window._saveOfficialSuppliers) window._saveOfficialSuppliers(state.officialSuppliers);
+    renderSuppliers();toast('Fornecedor oficial eliminado');
   },true);
 }
 
@@ -3901,6 +4018,17 @@ function getTrialInfo() {
 }
 
 function renderPlans() {
+  // Admin notice
+  if(isAdmin()) {
+    const inner = document.querySelector('#page-plans .section-inner') || document.querySelector('#page-plans');
+    if(inner && !document.getElementById('admin-plan-notice')) {
+      const notice = document.createElement('div');
+      notice.id = 'admin-plan-notice';
+      notice.style.cssText = 'background:var(--accent-dim);border:1px solid rgba(107,26,46,0.2);border-radius:12px;padding:12px 16px;margin-bottom:20px;display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text)';
+      notice.innerHTML = '<span style="font-size:18px">⭐</span><div><strong>Conta de Administrador</strong> — Acesso total sem cobrança. Plano Business permanente.</div>';
+      inner.insertBefore(notice, inner.firstChild);
+    }
+  }
   const trial = getTrialInfo();
   const banner = document.getElementById('trial-banner');
   const daysEl = document.getElementById('trial-days-left');
@@ -3928,6 +4056,7 @@ function selectPlan(plan) {
 
 // Show trial banner in dashboard too
 function renderTrialBanner() {
+  if(isAdmin()) return; // Admin never sees trial banner
   const trial = getTrialInfo();
   if(!trial.active) {
     const el = document.getElementById('dash-trial-banner');
@@ -3981,7 +4110,10 @@ function showApp() {
   // Update user email in company panel
   setTimeout(() => {
     const infoEl = document.getElementById('auth-user-info');
-    if(infoEl && window._currentUser) infoEl.textContent = '✉ ' + window._currentUser.email;
+    if(infoEl && window._currentUser) {
+      const adminBadge = isAdmin() ? ' <span style="background:var(--accent);color:#fff;font-size:9px;padding:1px 6px;border-radius:10px;font-weight:700;vertical-align:middle">ADMIN</span>' : '';
+      infoEl.innerHTML = '✉ ' + window._currentUser.email + adminBadge;
+    }
   }, 100);
 }
 
